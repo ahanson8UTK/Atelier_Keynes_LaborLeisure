@@ -1,0 +1,347 @@
+# Labor–Leisure Tradeoff Explorer — Indifference vs Budget
+# ECON 413 (Williamson 6e, Ch. 4)
+#
+# Preferences (given utility level a):
+#   a = ln C - γ * (1-L)^{1+1/η} / (1+1/η)
+# ⇒ Indifference curve in (L, C):
+#   C(L; a, η, γ) = exp( a + γ * (1-L)^{1+1/η} / (1+1/η) )
+#
+# Budget:
+#   C = w(1 - L) + ȳ,  where ȳ = (π - T)
+#
+# Tangency condition (interior optimum):
+#   w = γ * C * (1 - L)^{1/η}
+#
+# Baseline: η = 0.5, w = 1, ȳ = 0, a = -1/3, γ = 1
+
+library(shiny)
+library(ggplot2)
+
+BASE <- list(
+  eta   = 0.5,   # Frisch elasticity
+  w     = 1,     # wage
+  ybar  = 0,     # non-labor income net taxes: ȳ = (π − T)
+  a     = -1/3,     # utility level ("utils")
+  gamma = 1      # dislike for work
+)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+make_curves <- function(eta, w, ybar, a, gamma, n = 601, scenario = "Current") {
+  stopifnot(is.numeric(eta), is.numeric(w), is.numeric(ybar),
+            is.numeric(a), is.numeric(gamma), eta > 0, gamma >= 0)
+  L   <- seq(0, 1, length.out = n)
+  pow <- 1 + 1/eta
+  
+  C_indiff <- exp(a + gamma * ((1 - L)^pow) / pow)
+  C_budget <- w * (1 - L) + ybar
+  
+  rbind(
+    data.frame(
+      L = L, C = C_indiff,
+      Curve = "Indifference   a = ln C − γ·(1−L)^{1+1/η}/(1+1/η)",
+      Scenario = scenario
+    ),
+    data.frame(
+      L = L, C = C_budget,
+      Curve = "Budget         C = w·(1−L) + ȳ",
+      Scenario = scenario
+    )
+  )
+}
+
+# Robust intersection finder for C_indiff(L) = C_budget(L) over L ∈ [0,1]
+find_intersections <- function(eta, w, ybar, a, gamma, n_grid = 2000) {
+  stopifnot(eta > 0, gamma >= 0)
+  Lg  <- seq(0, 1, length.out = n_grid)
+  pow <- 1 + 1/eta
+  f   <- function(L) exp(a + gamma * ((1 - L)^pow) / pow) - (w * (1 - L) + ybar)
+  
+  vals <- f(Lg)
+  roots <- numeric(0)
+  for (i in seq_len(length(Lg) - 1)) {
+    v1 <- vals[i]; v2 <- vals[i + 1]
+    if (!is.finite(v1) || !is.finite(v2)) next
+    # capture sign change or exact zero on a grid edge
+    if (v1 == 0) roots <- c(roots, Lg[i])
+    if (v1 * v2 < 0 || v2 == 0) {
+      rt <- tryCatch(uniroot(f, interval = c(Lg[i], Lg[i + 1]))$root,
+                     error = function(e) NA_real_)
+      if (is.finite(rt)) roots <- c(roots, rt)
+    }
+  }
+  if (length(roots) == 0) return(data.frame(L = numeric(0), C = numeric(0)))
+  roots <- sort(unique(round(as.numeric(roots), 6))) # ensure numeric before round
+  Cvals <- exp(a + gamma * ((1 - roots)^pow) / pow)
+  data.frame(L = roots, C = Cvals)
+}
+
+# Solve for interior tangency via H = 1-L, using w = γ * C * H^{1/η} and C = wH + ȳ.
+# Returns list(H=LHS, L, C, a) or NULL if no interior tangency on [0,1] with C>0.
+solve_tangency <- function(eta, w, ybar, gamma, n_grid = 4000) {
+  stopifnot(eta > 0, gamma >= 0)
+  if (w <= 0) return(NULL)  # with zero wage, interior tangency typically fails
+  
+  Hgrid <- seq(0, 1, length.out = n_grid)
+  # Ensure C>0 along the grid (log utility requires C>0)
+  Cgrid <- w * Hgrid + ybar
+  Fvals <- gamma * Cgrid * (Hgrid^(1/eta)) - w
+  Fvals[!is.finite(Fvals) | Cgrid <= 0] <- NA_real_
+  
+  # scan for sign changes
+  for (i in seq_len(length(Hgrid) - 1)) {
+    v1 <- Fvals[i]; v2 <- Fvals[i + 1]
+    if (!is.finite(v1) || !is.finite(v2)) next
+    if (v1 == 0) {
+      Hstar <- Hgrid[i]
+      Cstar <- w * Hstar + ybar
+      if (Cstar > 0) {
+        Lstar <- 1 - Hstar
+        pow   <- 1 + 1/eta
+        astar <- log(Cstar) - gamma * (Hstar^pow) / pow
+        return(list(H = Hstar, L = Lstar, C = Cstar, a = astar))
+      }
+    }
+    if (v1 * v2 < 0 || v2 == 0) {
+      # refine with uniroot on a valid interval
+      lo <- Hgrid[i]; hi <- Hgrid[i + 1]
+      fH <- function(H) gamma * (w * H + ybar) * (H^(1/eta)) - w
+      # ensure C>0 throughout the bracket; otherwise skip
+      if (min(w * lo + ybar, w * hi + ybar) <= 0) next
+      Hstar <- tryCatch(uniroot(fH, c(lo, hi))$root, error = function(e) NA_real_)
+      if (is.finite(Hstar)) {
+        Cstar <- w * Hstar + ybar
+        if (Cstar <= 0) next
+        Lstar <- 1 - Hstar
+        pow   <- 1 + 1/eta
+        astar <- log(Cstar) - gamma * (Hstar^pow) / pow
+        return(list(H = Hstar, L = Lstar, C = Cstar, a = astar))
+      }
+    }
+  }
+  return(NULL)
+}
+
+# Fallback: maximize utility along the budget on [0,1] with C>0 (for boundary cases)
+maximize_on_budget <- function(eta, w, ybar, gamma, n = 20001) {
+  stopifnot(eta > 0, gamma >= 0)
+  H <- seq(0, 1, length.out = n)
+  C <- w * H + ybar
+  mask <- C > 0
+  if (!any(mask)) return(NULL)
+  pow <- 1 + 1/eta
+  U <- log(C[mask]) - gamma * (H[mask]^pow) / pow
+  j <- which.max(U)
+  Hstar <- H[mask][j]
+  Cstar <- C[mask][j]
+  Lstar <- 1 - Hstar
+  astar <- log(Cstar) - gamma * (Hstar^pow) / pow
+  list(H = Hstar, L = Lstar, C = Cstar, a = astar)
+}
+
+# ----------------------------
+# UI
+# ----------------------------
+ui <- fluidPage(
+  titlePanel("Labor–Leisure: Indifference Curves vs Budget (Williamson 6e)"),
+  
+  tags$div(
+    style = "margin-bottom: 8px;",
+    withMathJax(
+      helpText(HTML(
+        "<b>Indifference curve:</b> &nbsp; \\(a = \\ln C - \\gamma\\,\\dfrac{(1-L)^{1+1/\\eta}}{1+1/\\eta}\\)
+         &nbsp; ⇒ &nbsp; \\(C(L)=\\exp\\!\\Big(a + \\gamma\\,\\dfrac{(1-L)^{1+1/\\eta}}{1+1/\\eta}\\Big)\\).<br/>
+         <b>Budget line:</b> &nbsp; \\(C = w(1-L) + \\overline{y}\\), with \\(\\overline{y}=(\\pi-T)\\).<br/>
+         <b>Tangency (interior optimum):</b> &nbsp; \\(w = \\gamma\\,C\\,(1-L)^{1/\\eta}\\)."
+      ))
+    )
+  ),
+  
+  fluidRow(
+    column(
+      width = 4,
+      wellPanel(
+        h4("Parameters"),
+        sliderInput("eta", HTML("&eta; (Frisch labor supply elasticity)"),
+                    min = 0.1, max = 30, value = BASE$eta, step = 0.001),
+        tags$small("Bigger ", tags$em("η"), " means you’ll work more for the same wage increase."),
+        br(), br(),
+        
+        sliderInput("gamma", HTML("&gamma; (how much you dislike working)"),
+                    min = 0, max = 50, value = BASE$gamma, step = 0.001),
+        
+        sliderInput("w", "w (real wage)",
+                    min = 0, max = 50, value = BASE$w, step = 0.001),
+        
+        sliderInput("ybar", HTML("&pi; − T (non‑labor income net taxes, \\(\\overline{y}\\))"),
+                    min = -1, max = 4, value = BASE$ybar, step = 0.001),
+        
+        sliderInput("a", "a (utility level in utils)",
+                    min = -5, max = 2, value = BASE$a, step = 0.001),
+        
+        fluidRow(
+          column(6, actionButton("reset", "Reset to Baseline")),
+          column(6, actionButton("set_tangent_a", "Set a to equilibrium (tangency)"))
+        ),
+        
+        tags$hr(),
+        helpText(HTML("<b>Axes:</b> Leisure \\(L\\in[0,1]\\) on x; Consumption \\(C>0\\) on y.  Note: \\(1-L\\) is hours worked."))
+      ),
+      
+      wellPanel(
+        h4("Intersection(s) with the budget"),
+        uiOutput("intersection_text"),
+        tags$small("Points in L ∈ [0,1] where the chosen indifference curve meets the budget. Tangency shows as a single intersection.")
+      )
+    ),
+    
+    column(
+      width = 8,
+      tabsetPanel(
+        tabPanel(
+          title = "Explore (Current Parameters)",
+          br(),
+          plotOutput("plot_current", height = "460px")
+        ),
+        tabPanel(
+          title = "Compare: Baseline vs Current",
+          br(),
+          plotOutput("plot_compare", height = "460px"),
+          tags$div(
+            style = "margin-top: 8px;",
+            tags$small(
+              HTML("<b>Style key:</b> Baseline = dashed (lighter); Current = solid.")
+            )
+          )
+        )
+      )
+    )
+  ),
+  
+  tags$hr(),
+  tags$small(
+    HTML(
+      "<b>Parameter labels:</b> &eta; = Frisch labor supply elasticity; ",
+      "&gamma; = how much you dislike working; ",
+      "w = wage; ",
+      "(\\(\\pi - T\\)) = non‑labor income net taxes); ",
+      "a = utility level in utils."
+    )
+  )
+)
+
+# ----------------------------
+# Server
+# ----------------------------
+server <- function(input, output, session) {
+  
+  observeEvent(input$reset, {
+    updateSliderInput(session, "eta",   value = BASE$eta)
+    updateSliderInput(session, "gamma", value = BASE$gamma)
+    updateSliderInput(session, "w",     value = BASE$w)
+    updateSliderInput(session, "ybar",  value = BASE$ybar)
+    updateSliderInput(session, "a",     value = BASE$a)
+  })
+  
+  observeEvent(input$set_tangent_a, {
+    eq <- solve_tangency(input$eta, input$w, input$ybar, input$gamma)
+    if (!is.null(eq)) {
+      updateSliderInput(session, "a", value = eq$a)
+      showNotification(sprintf("Set a to tangency: L* = %.3f, C* = %.3f", eq$L, eq$C), type = "message", duration = 4)
+    } else {
+      # No interior tangency; fall back to boundary maximizer on the budget
+      b <- maximize_on_budget(input$eta, input$w, input$ybar, input$gamma)
+      if (!is.null(b)) {
+        updateSliderInput(session, "a", value = b$a)
+        showNotification(sprintf("No interior tangency. Set a to boundary optimum: L^ = %.3f, C^ = %.3f", b$L, b$C),
+                         type = "warning", duration = 5)
+      } else {
+        showNotification("No feasible point with C>0 on the budget (cannot set a).",
+                         type = "error", duration = 6)
+      }
+    }
+  })
+  
+  current_df  <- reactive({
+    make_curves(input$eta, input$w, input$ybar, input$a, input$gamma, scenario = "Current")
+  })
+  baseline_df <- reactive({
+    make_curves(BASE$eta, BASE$w, BASE$ybar, BASE$a, BASE$gamma, scenario = "Baseline")
+  })
+  
+  intersections <- reactive({
+    find_intersections(input$eta, input$w, input$ybar, input$a, input$gamma)
+  })
+  
+  output$intersection_text <- renderUI({
+    pts <- intersections()
+    if (nrow(pts) == 0) {
+      HTML("<span style='color:#666;'>No intersection in L ∈ [0,1].</span>")
+    } else {
+      HTML(paste(sprintf("L* = <b>%.3f</b>, C* = <b>%.3f</b>", pts$L, pts$C), collapse = "<br/>"))
+    }
+  })
+  
+  compute_ylim <- reactive({
+    comb <- rbind(current_df(), baseline_df())
+    ymax <- max(0, comb$C, na.rm = TRUE)
+    c(0, ymax * 1.05 + 1e-9)
+  })
+  
+  # --- Plot 1: Current only ---
+  output$plot_current <- renderPlot({
+    df  <- current_df()
+    pts <- intersections()
+    
+    ggplot(df, aes(x = L, y = C, color = Curve)) +
+      geom_line(size = 1.2) +
+      { if (nrow(pts) > 0) geom_point(data = pts, aes(L, C), inherit.aes = FALSE, size = 3) } +
+      { if (nrow(pts) > 0) geom_label(
+        data = transform(pts, lab = "Intersection"),
+        aes(L, C, label = lab),
+        inherit.aes = FALSE, size = 3, label.size = 0.25,
+        nudge_x = 0.03, nudge_y = 0.03
+      ) } +
+      scale_color_manual(values = c(
+        "Indifference   a = ln C − γ·(1−L)^{1+1/η}/(1+1/η)" = "#1f77b4",
+        "Budget         C = w·(1−L) + ȳ"                   = "#d62728"
+      )) +
+      coord_cartesian(ylim = compute_ylim()) +
+      labs(x = "Leisure  L", y = "Consumption  C", color = NULL) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "top")
+  })
+  
+  # --- Plot 2: Baseline vs Current (overlay) ---
+  output$plot_compare <- renderPlot({
+    df <- rbind(current_df(), baseline_df())
+    
+    ggplot(df, aes(x = L, y = C, color = Curve, linetype = Scenario, alpha = Scenario)) +
+      geom_line(size = 1.2) +
+      scale_color_manual(values = c(
+        "Indifference   a = ln C − γ·(1−L)^{1+1/η}/(1+1/η)" = "#1f77b4",
+        "Budget         C = w·(1−L) + ȳ"                   = "#d62728"
+      )) +
+      scale_linetype_manual(values = c("Baseline" = "22", "Current" = "solid")) +
+      scale_alpha_manual(values     = c("Baseline" = 0.8,  "Current" = 1)) +
+      coord_cartesian(ylim = compute_ylim()) +
+      labs(x = "Leisure  L", y = "Consumption  C",
+           color = NULL, linetype = NULL, alpha = NULL) +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "top")
+  })
+}
+
+shinyApp(ui, server)
+
+# ---------------------------------- Questions to Answer -----------------------
+# 1. What does the area on and under the budget constraint (red) line represent?
+#    Which parameter sliders can change the budget constraint line?
+# 2. What does the indifference curve (blue) line represent? Apart from a, what 
+#    parameter sliders can change the indifference curve?
+# 3. When you increase a, what happens to the indifference curve? What does this mean?
+# 4. What happens when you change one of the sliders and then press the 
+#    "Set a to equilibrium (tangency) button?
+# 5. Why do equilibrium occur at a tangency condition?
+# 6. Play around with the sliders and note anything interesting you find.
