@@ -1,0 +1,145 @@
+# ECON 413 — Keynes Consumption Atelier (per‑capita; minimal deps; no API key)
+# C_t = C̄ + MPC * Y_{d,t}, with C and Y_d expressed per working‑age person
+# Series:
+#   - PCECC96  : Real PCE (billions, chained 2017 $, SAAR, quarterly)
+#   - DPIC96   : Real DPI (billions, chained 2017 $, SAAR, quarterly)
+#   - CNP16OV  : Civilian Noninstitutional Population, 16+ (thousands, monthly; SA)
+# Notes:
+#   - Population is aggregated to quarterly (average of months in quarter).
+#   - Axes use *thousands* of $ per person for readability.
+
+# ------------------------------- Packages ------------------------------------
+safe_load <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, type = "binary", quiet = TRUE)
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+safe_load("quantmod")
+safe_load("ggplot2")
+safe_load("zoo")
+
+# ------------------------------- Settings ------------------------------------
+start_qtr   <- "2000 Q1"     # classroom window; adjust as you like
+annual_rate <- TRUE          # TRUE = $ per person per *year* (SAAR); FALSE = per *quarter*
+use_thousands_for_axes <- TRUE  # plot in thousands of $ per person
+
+# If you prefer a narrower “working‑age” definition (15–64), you can swap to:
+#   pop_series <- "LFWA64TTUSM647S"  # Working‑Age Population: 15–64 (thousands, monthly)
+pop_series <- "CNP16OV"  # Civilian Noninstitutional Population, 16+ (thousands, monthly)
+
+# ------------------------------- Data pull -----------------------------------
+pce_xts <- getSymbols("PCECC96", src = "FRED", auto.assign = FALSE)   # quarterly
+dpi_xts <- getSymbols("DPIC96",  src = "FRED", auto.assign = FALSE)   # quarterly
+pop_xts <- getSymbols(pop_series, src = "FRED", auto.assign = FALSE)  # monthly
+
+# Convert to zoo with year-quarter index
+pce_z <- zoo(coredata(pce_xts), as.yearqtr(index(pce_xts)))
+dpi_z <- zoo(coredata(dpi_xts), as.yearqtr(index(dpi_xts)))
+
+# Aggregate population to quarterly average (same as BEA convention for flows)
+pop_m_z <- zoo(coredata(pop_xts), index(pop_xts))               # monthly, Date index
+pop_q_z <- aggregate(pop_m_z, as.yearqtr, mean)                 # quarterly avg
+colnames(pop_q_z) <- "pop_thousands"
+
+# Merge & window
+zq <- merge(pce_z, dpi_z, pop_q_z, all = FALSE)
+colnames(zq) <- c("real_pce", "real_dpi", "pop_thousands")
+zq <- window(zq, start = as.yearqtr(start_qtr))
+
+# --------------------------- Per‑capita transform ----------------------------
+# PCE/DPI are billions SAAR -> convert to $ at annual rate; divide by persons.
+# If annual_rate == FALSE, convert to per quarter by dividing by 4.
+scale_to_dollars <- 1e9
+persons          <- as.numeric(zq[, "pop_thousands"]) * 1000
+
+c_pc <- as.numeric(zq[, "real_pce"]) * scale_to_dollars / persons  # $/person/year
+y_pc <- as.numeric(zq[, "real_dpi"]) * scale_to_dollars / persons  # $/person/year
+if (!annual_rate) { c_pc <- c_pc / 4; y_pc <- y_pc / 4 }
+
+# Plot in *thousands* of dollars (nicer axes), if requested
+divisor <- if (use_thousands_for_axes) 1000 else 1
+c_pc_u  <- c_pc / divisor
+y_pc_u  <- y_pc / divisor
+
+# For reference: “levels” model on aggregates (not per capita)
+fit_levels <- lm(as.numeric(zq[, "real_pce"]) ~ as.numeric(zq[, "real_dpi"]))
+mpc_levels <- unname(coef(fit_levels)[2])
+
+# Build dataframe for plotting/OLS
+df <- data.frame(
+  qtr  = index(zq),
+  c_pc = c_pc_u,
+  y_pc = y_pc_u
+)
+
+# ------------------------------- OLS & table ---------------------------------
+fit   <- lm(c_pc ~ y_pc, data = df)
+smry  <- summary(fit)
+ci    <- confint(fit)
+cbar  <- unname(coef(fit)[1])
+mpc   <- unname(coef(fit)[2])
+
+coef_tbl <- data.frame(
+  Parameter    = c("Intercept (C\u0305)", "Slope (MPC)"),
+  Estimate     = c(cbar, mpc),
+  `Std. Error` = smry$coefficients[, "Std. Error"],
+  `t-stat`     = smry$coefficients[, "t value"],
+  `p-value`    = smry$coefficients[, "Pr(>|t|)"],
+  `CI 2.5%`    = ci[, 1],
+  `CI 97.5%`   = ci[, 2],
+  check.names  = FALSE
+)
+
+dir.create("figs",   showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+write.csv(coef_tbl, "tables/consumption_on_rdi_percap_regression.csv", row.names = FALSE)
+
+# ------------------------------- Plot ----------------------------------------
+start_lbl <- format(min(df$qtr), "%YQ%q")
+end_lbl   <- format(max(df$qtr), "%YQ%q")
+
+unit_stub <- if (annual_rate) "per year (SAAR)" else "per quarter"
+axis_stub <- if (use_thousands_for_axes) "Thousands of " else ""
+ann <- paste0(
+  "C = \u0305C + MPC \u00D7 Y_d\n",
+  "\u0305C (intercept) = ", formatC(cbar, format = "f", digits = 1, big.mark = ","), "\n",
+  "MPC (slope) = ", formatC(mpc, format = "f", digits = 3), "\n",
+  "Adjusted R^2 = ", formatC(smry$adj.r.squared, format = "f", digits = 3)
+)
+
+p <- ggplot(df, aes(x = y_pc, y = c_pc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  labs(
+    title = "Keynesian Consumption Fit (Per Working‑Age Person)",
+    subtitle = paste0("Sample: ", start_lbl, "–", end_lbl),
+    x = paste0("Real Disposable Income ", axis_stub, "2017 chained $ per person, ", unit_stub),
+    y = paste0("Real Consumption ",       axis_stub, "2017 chained $ per person, ", unit_stub),
+    caption = paste0(
+      "Series: DPIC96, PCECC96 (quarterly); ", pop_series, " (monthly → quarterly avg). ",
+      "FRED via quantmod."
+    )
+  ) +
+  annotate("label",
+           x = quantile(df$y_pc, 0.60, na.rm = TRUE),
+           y = quantile(df$c_pc, 0.12, na.rm = TRUE),
+           label = ann, label.size = 0.4, alpha = 0.2) +
+  theme_minimal(base_size = 12)
+
+print(p)
+
+ggsave("figs/consumption_vs_rdi_percap_scatter.png", p, width = 7.5, height = 5.5, dpi = 200)
+
+# ------------------------------- Console notes -------------------------------
+cat(sprintf("\nModel summary (per‑capita): R^2 = %.4f | Adj R^2 = %.4f | N = %d\n",
+            smry$r.squared, smry$adj.r.squared, nrow(df)))
+cat(sprintf("MPC (levels): %.3f | MPC (per‑capita): %.3f\n", mpc_levels, mpc))
+cat("\nSaved:\n",
+    "  - figs/consumption_vs_rdi_percap_scatter.png\n",
+    "  - tables/consumption_on_rdi_percap_regression.csv\n", sep = "")
+
+# ------------------------------- To Answer -----------------------------------
+# 1. What does this result tell you about Keynes' assumed consumption function
+#    we used in ECON 313?
+# 2. Is there anything you think is missing or wrong with his functional form?
